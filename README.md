@@ -1,46 +1,38 @@
 # USB Access Control (Windows)
 
-A lightweight, open-source USB input monitoring and authorization tool for Windows designed to reduce the risk of opportunistic or low skill HID attacks (e.g., BadUSB / Rubber Ducky devices).
+A lightweight, open-source tray utility for Windows that **locks and unlocks USB device installation/access** with a human approval step. It’s designed to reduce the risk of opportunistic or low-skill attacks that rely on quickly plugging in new devices (HID injection devices) and to optionally block **USB storage** (flash drives) when locked.
 
-This project is not a full endpoint protection solution or a kernel-level security control. It is a user-space safeguard intended to raise the bar against **low skill unsophisticated HID injection attacks** by introducing a human approval step before new input devices are trusted.
+This is **not** a kernel driver or enterprise endpoint solution. It’s a user-space control layer that toggles **Windows policy settings** to raise the bar against casual misuse.
 
 ---
 
 ## Security posture and threat model
 
-This tool is designed with a **defensive, convenience-oriented threat model**, not a high-assurance or adversarial one.
+This tool follows a **defensive, convenience-oriented threat model**, not a high-assurance one.
 
 It is effective against:
-- Casual or automated HID attack tools
-- “Plug-and-run” malicious keyboards/mice
-- Drive-by HID payloads that rely on immediate execution
+- “Plug-and-run” HID injection attempts that rely on immediate acceptance/install
+- Casual/low-skill HID attack devices
+- Opportunistic use of USB flash drives when the system is set to “locked”
+- Situations where you want a quick “lockdown” switch for HID installs + removable storage access
 
 It is **not designed to stop**:
-- Memory storage devices (USB Flash Drives)
-- A determined attacker with local access
+- A determined attacker with local admin access
 - Malware already running on the system
-- Someone willing to invest time in bypassing or disabling protections
-- Kernel-level or driver-based USB attacks
-
-If you need strong, enterprise-grade USB control, you should look into:
-- Microsoft Endpoint Manager (Intune) USB policies  
-- Windows Defender Application Control  
-- Third-party endpoint security platforms  
+- Kernel/driver-level USB attacks
+- Hardware attacks that don’t rely on Windows install/access paths
+- Someone willing to disable policies, tamper with the process, or reconfigure the machine
 
 ---
 
-## What the program does
+## How it works (high level)
 
-When running, the tray monitor:
+The tool uses a small elevated helper to toggle Windows policy keys under:
 
-- Starts automatically on user logon  
-- Continuously monitors USB device insertions  
-- Detects newly connected HID-class devices (keyboards, mice, and similar input devices)  
-- Prompts the user with a GUI dialog when an unknown device appears  
-- Allows the user to “whitelist” trusted devices  
-- Stores the whitelist persistently and reuses it across sessions  
+- Device installation restrictions (deny HID/keyboard/mouse install classes)
+- Removable storage access (deny removable storage access)
 
-If a device is **not** whitelisted, the user will be prompted again the next time it is inserted.
+Because these are **system-wide policies**, Windows will require Administrator approval (UAC) unless you deploy a pre-authorized mechanism (e.g., scheduled task “run with highest privileges”).
 
 ---
 
@@ -48,34 +40,28 @@ If a device is **not** whitelisted, the user will be prompted again the next tim
 
 ⚠️ **Current implementation uses a hardcoded password in the GUI.**
 
-This is intentionally simple and should **not** be considered secure authentication. The current approach is only meant to prevent accidental or impulsive whitelisting.
-
-A more appropriate design for real use would be to:
-
-- Hash the password using a strong algorithm (e.g., bcrypt, scrypt, or Argon2)  
-- Store only the password hash (never the plaintext password) in a protected location  
-- Compare the entered password against the stored hash  
-- Potentially integrate with Windows authentication instead of using a custom password  
-
-Because of this, the current implementation should be treated as a **proof of concept / security aid**, not a hardened access control system.
-
 ---
 
 ## Limitations
 
-- This is a **user-space** monitor, not a kernel driver.  
-- It does **not** control or block USB storage devices.  
-- It relies on Python and Windows APIs, which can be tampered with by malware.  
-- A knowledgeable user or attacker can disable or bypass it with sufficient effort.  
-- The current password mechanism is rudimentary and should be improved before any real-world deployment.
+- User-space tool (not a driver)
+- Policies can be changed/tampered with by an admin user or malware
+- Does not provide cryptographic device identity or true attestation
+- Users still need admin elevation (UAC) for policy changes unless you pre-authorize via scheduled task/service
+- The tool does not “retroactively kill” already-working devices (safer default)
 
 ---
 
 ## Requirements
 
-- Windows 10 or Windows 11  
-- Python 3.10+  
+- Windows 10 / Windows 11
+- Python 3.10+
 - Required packages:
 
+## How to run (from project directory)
+```Powershell
+.\install_autostart.ps1
+```
+
 ```bash
-pip install pywin32 wmi
+pip install pywin32 pystray pillow
