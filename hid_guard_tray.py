@@ -1,25 +1,25 @@
+# hid_guard_tray.py
 import os
 import sys
-import json
 import time
+import subprocess
 import tkinter as tk
 from tkinter import messagebox
 
-import wmi
-import win32api
-import win32event
-import win32con
-import winerror
-import pywintypes
-import win32process
+import pystray
+from PIL import Image, ImageDraw
 
-# ---------- Paths ----------
-DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
-APPDATA_DIR = os.path.join(DESKTOP_DIR, "USB_Access_Controller")
-WHITELIST_PATH = os.path.join(APPDATA_DIR, "whitelist_instance_ids.json")
-os.makedirs(APPDATA_DIR, exist_ok=True)
-LOG_PATH = os.path.join(APPDATA_DIR, "tray.log")
-HELPER = os.path.join(os.path.dirname(__file__), "hid_guard_helper.py")
+import pywintypes
+import win32con, win32event, win32process, winerror
+import win32com.shell.shell as shell
+import win32com.shell.shellcon as shellcon
+
+BASE_DIR = os.path.dirname(__file__)
+HELPER = os.path.join(BASE_DIR, "hid_guard_helper.py")
+LOG_PATH = os.path.join(BASE_DIR, "data", "tray.log")
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+SCRIPT_PATH = os.path.abspath(sys.argv[0])
 
 def log(msg: str):
     try:
@@ -28,254 +28,334 @@ def log(msg: str):
     except Exception:
         pass
 
-# ---------- Single instance (named mutex) ----------
-try:
-    mutex = win32event.CreateMutex(None, False, "Global\\USB_Access_Control_Tray")
-    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        sys.exit(0)
-except Exception as e:
-    log(f"Mutex exception: {e!r}")
+PASSWORD = "12345"  # keep your guard
 
-log("Tray started (instance OK).")
 
-def load_whitelist():
-    if not os.path.exists(WHITELIST_PATH):
-        return set()
-    try:
-        with open(WHITELIST_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set(str(x) for x in data if x)
-    except Exception as e:
-        log(f"Whitelist load error: {e!r}")
-        return set()
-
-def run_helper_elevated_wait(args, timeout_ms=30000) -> bool:
+# ------------------ Elevated helper runner ------------------
+def run_helper_elevated_wait(args, timeout_ms=60000):
     python_exe = sys.executable
     params = f"\"{HELPER}\" " + " ".join(f"\"{a}\"" for a in args)
-    log(f"Running helper elevated(wait): {params}")
 
     try:
-        proc_info = win32api.ShellExecuteEx(
+        proc_info = shell.ShellExecuteEx(
+            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
             lpVerb="runas",
             lpFile=python_exe,
             lpParameters=params,
-            nShow=win32con.SW_HIDE,
-            fMask=win32con.SEE_MASK_NOCLOSEPROCESS,
+            nShow=win32con.SW_SHOWNORMAL,
         )
+
         hproc = proc_info["hProcess"]
         rc = win32event.WaitForSingleObject(hproc, timeout_ms)
         if rc == win32con.WAIT_TIMEOUT:
-            log("Helper timed out waiting for exit.")
-            return False
+            return False, "timeout"
 
         exit_code = win32process.GetExitCodeProcess(hproc)
-        log(f"Helper exit code: {exit_code}")
-        return exit_code == 0
+        return (exit_code == 0), f"exit_code={exit_code}"
 
     except pywintypes.error as e:
-        log(f"ShellExecuteEx error: {e!r}")
+        code = getattr(e, "winerror", None)
+        if code in (winerror.ERROR_CANCELLED, 1223):
+            return False, "UAC canceled"
+        return False, f"ShellExecuteEx error {code}: {e}"
 
-        if getattr(e, "winerror", None) in (winerror.ERROR_CANCELLED, 1223):
-            log("UAC canceled by user.")
-            return False
+    except Exception as e:
+        return False, str(e)
 
-        log("Elevation failed for other reason.")
+
+def helper_status_locked():
+    # helper prints 1 if locked else 0
+    try:
+        p = subprocess.run([sys.executable, HELPER, "status"], capture_output=True, text=True, timeout=5)
+        return (p.stdout or "").strip() == "1"
+    except Exception:
         return False
 
-def snapshot_hid_like():
-    """
-    Return a set of PNPDeviceIDs that look like HID input devices.
-    """
-    c = wmi.WMI()
-    s = set()
-    for d in c.Win32_PnPEntity():
-        pnp = (getattr(d, "PNPDeviceID", "") or "").strip()
-        name = (getattr(d, "Name", "") or "").strip().upper()
-        if not pnp:
-            continue
-        if pnp.startswith(("HID\\", "USB\\")) and ("KEYBOARD" in name or "MOUSE" in name or "HID" in name):
-            s.add(pnp)
-    return s
 
-def prompt_whitelist(pnp_id: str):
-    log(f"Prompting for: {pnp_id}")
+# ------------------ UI process (Tk) ------------------
+class PasswordDialog:
+    def __init__(self, parent, title, current_locked: bool, target_lock: bool):
+        self.parent = parent
+        self.value = None
 
-    PASSWORD = "12345"
+        # --- Theme ---
+        BG = "#121212"
+        CARD = "#1E1E1E"
+        FG = "#EAEAEA"
+        MUTED = "#B0B0B0"
+        ENTRY_BG = "#2A2A2A"
+        BTN_BG = "#2D2D2D"
+        BTN_ACTIVE = "#3A3A3A"
+        BORDER = "#333333"
+        ERROR = "#7CFC9A"
+        OK = "#FF5A5A"
 
-    root = tk.Tk()
-    root.title("USB Access Control")
-    root.resizable(False, False)
+        status_text = "LOCKED" if current_locked else "UNLOCKED"
+        status_color = OK if current_locked else ERROR  # Locked=green (safe), Unlocked=red (open)
 
-    # Modal-ish behavior
-    root.attributes("-topmost", True)
-    root.grab_set()
-
-    # --- Dark theme colors ---
-    BG = "#121212"
-    CARD = "#1E1E1E"
-    FG = "#EAEAEA"
-    MUTED = "#B0B0B0"
-    ENTRY_BG = "#2A2A2A"
-    BTN_BG = "#2D2D2D"
-    BTN_ACTIVE = "#3A3A3A"
-    BORDER = "#333333"
-    ERROR = "#FF5A5A"
-
-    root.configure(bg=BG)
-
-    # Use ttk where it helps, but keep it simple with classic widgets
-    # (ttk theming is inconsistent on some Windows setups without extra libs)
-    result = {"ok": False}
-
-    outer = tk.Frame(root, bg=BG, padx=14, pady=14)
-    outer.pack(fill="both", expand=True)
-
-    card = tk.Frame(outer, bg=CARD, padx=16, pady=14, highlightbackground=BORDER, highlightthickness=1)
-    card.pack(fill="both", expand=True)
-
-    title = tk.Label(card, text="Blocked input device detected", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
-    title.pack(anchor="w")
-
-    subtitle = tk.Label(
-        card,
-        text="A new HID/keyboard/mouse device was detected.\nEnter password to whitelist (always allow).",
-        bg=CARD,
-        fg=MUTED,
-        font=("Segoe UI", 9),
-        justify="left",
-    )
-    subtitle.pack(anchor="w", pady=(6, 10))
-
-    pnp_box = tk.Text(card, height=3, width=72, bg=ENTRY_BG, fg=FG, relief="flat", wrap="word")
-    pnp_box.insert("1.0", pnp_id)
-    pnp_box.configure(state="disabled")
-    pnp_box.pack(fill="x", pady=(0, 12))
-
-    tk.Label(card, text="Password", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-
-    pw_var = tk.StringVar()
-    entry = tk.Entry(
-        card,
-        textvariable=pw_var,
-        show="•",
-        width=28,
-        bg=ENTRY_BG,
-        fg=FG,
-        insertbackground=FG,
-        relief="flat",
-        highlightthickness=1,
-        highlightbackground=BORDER,
-        highlightcolor=BORDER,
-    )
-    entry.pack(anchor="w", pady=(6, 6))
-    entry.focus_set()
-
-    status = tk.Label(card, text="", bg=CARD, fg=ERROR, font=("Segoe UI", 9))
-    status.pack(anchor="w", pady=(2, 0))
-
-    hint = tk.Label(
-        card,
-        text="This will trigger a Windows admin (UAC) prompt if accepted.",
-        bg=CARD,
-        fg=MUTED,
-        font=("Segoe UI", 8),
-    )
-    hint.pack(anchor="w", pady=(10, 0))
-
-    btn_row = tk.Frame(card, bg=CARD, pady=12)
-    btn_row.pack(fill="x")
-
-    def on_cancel():
-        result["ok"] = False
-        root.destroy()
-
-    def style_button(btn: tk.Button):
-        btn.configure(
-            bg=BTN_BG,
-            fg=FG,
-            activebackground=BTN_ACTIVE,
-            activeforeground=FG,
-            relief="flat",
-            bd=0,
-            padx=14,
-            pady=8,
-            cursor="hand2",
-            font=("Segoe UI", 9, "bold"),
+        action_text = (
+            "You are about to LOCK: HID installs will be denied and USB storage will be denied."
+            if target_lock
+            else "You are about to UNLOCK: HID installs allowed and USB storage allowed."
         )
 
-    def on_ok():
-        if pw_var.get() != PASSWORD:
-            status.config(text="Wrong password.")
-            root.bell()
-            return
+        self.win = tk.Toplevel(parent)
+        self.win.title(title)
+        self.win.resizable(False, False)
+        self.win.configure(bg=BG)
 
-        status.config(text="Requesting admin approval (UAC)...")
+        # Modal
+        self.win.grab_set()
+        self.win.attributes("-topmost", True)
+
+        outer = tk.Frame(self.win, bg=BG, padx=18, pady=18)
+        outer.pack(fill="both", expand=True)
+
+        card = tk.Frame(outer, bg=CARD, padx=18, pady=16, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(card, text="USB Access Control", bg=CARD, fg=FG, font=("Segoe UI", 13, "bold")).pack(anchor="w")
+
+        # Status row
+        row = tk.Frame(card, bg=CARD)
+        row.pack(anchor="w", pady=(10, 6), fill="x")
+
+        tk.Label(row, text="Current status:", bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(side="left")
+        tk.Label(row, text=f" {status_text}", bg=CARD, fg=status_color, font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        # Action text
+        tk.Label(
+            card,
+            text=action_text,
+            bg=CARD,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(4, 12))
+
+        tk.Label(card, text="Password", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+
+        self.var = tk.StringVar()
+        self.entry = tk.Entry(
+            card,
+            textvariable=self.var,
+            show="•",
+            width=36,
+            bg=ENTRY_BG,
+            fg=FG,
+            insertbackground=FG,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=BORDER,
+            font=("Segoe UI", 10),
+        )
+        self.entry.pack(anchor="w", pady=(6, 6))
+
+        self.status_lbl = tk.Label(card, text="", bg=CARD, fg=ERROR, font=("Segoe UI", 9))
+        self.status_lbl.pack(anchor="w", pady=(2, 0))
+
+        btns = tk.Frame(card, bg=CARD, pady=14)
+        btns.pack(fill="x")
+
+        def style_button(btn: tk.Button):
+            btn.configure(
+                bg=BTN_BG,
+                fg=FG,
+                activebackground=BTN_ACTIVE,
+                activeforeground=FG,
+                relief="flat",
+                bd=0,
+                padx=16,
+                pady=10,
+                cursor="hand2",
+                font=("Segoe UI", 10, "bold"),
+            )
+
+        cancel_btn = tk.Button(btns, text="Cancel", command=self.on_cancel)
+        style_button(cancel_btn)
+        cancel_btn.pack(side="right")
+
+        ok_btn = tk.Button(btns, text="OK", command=self.on_ok)
+        style_button(ok_btn)
+        ok_btn.pack(side="right", padx=(0, 10))
+
+        # Bindings
+        self.win.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.entry.bind("<Return>", lambda _e: self.on_ok())
+        self.entry.bind("<Escape>", lambda _e: self.on_cancel())
+
+        # Clear error when typing
+        def clear_error(*_):
+            if self.status_lbl.cget("text"):
+                self.status_lbl.config(text="")
+        self.var.trace_add("write", clear_error)
+
+        # Bigger window (consistent size)
+        self.win.update_idletasks()
+        self.win.minsize(580, 260)
+
+        # Center + focus
+        self.win.update_idletasks()
+        w = self.win.winfo_width()
+        h = self.win.winfo_height()
+        x = (self.win.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.win.winfo_screenheight() // 2) - (h // 2)
+        self.win.geometry(f"+{x}+{y}")
+
+        self.win.lift()
+        self.win.focus_force()
+        self.entry.focus_set()
+
+    def on_ok(self):
+        self.value = self.var.get()
+        self.win.destroy()
+
+    def on_cancel(self):
+        self.value = None
+        self.win.destroy()
+
+    def show(self):
+        self.parent.wait_window(self.win)
+        return self.value
+
+def run_ui_toggle():
+    try:
+        log("UI process started: entering run_ui_toggle()")
+        root = tk.Tk()
+        root.withdraw()  # fully hide the root (no top-left ghost window)
         root.update_idletasks()
 
-        ok = run_helper_elevated_wait(["add", pnp_id])
-        if not ok:
-            status.config(text="Admin prompt was canceled (or failed). Device is still blocked. Click OK to retry.")
-            root.bell()
+        current_locked = helper_status_locked()
+        target_lock = not current_locked
+
+        dlg = PasswordDialog(root, "USB Access Control", current_locked=current_locked, target_lock=target_lock)
+        pw = dlg.show()
+
+        if pw is None:
+            root.destroy()
             return
 
-        result["ok"] = True
+        if pw != PASSWORD:
+            messagebox.showerror("USB Access Control", "Wrong password.")
+            root.destroy()
+            return
+
+        ok, err = run_helper_elevated_wait(["lock_all" if target_lock else "unlock_all"])
+        if not ok:
+            messagebox.showerror("USB Access Control", f"Failed: {err}")
+        else:
+            # After success, show new status in the success message
+            new_status = "LOCKED" if target_lock else "UNLOCKED"
+            messagebox.showinfo("USB Access Control", f"Done.\nNew status: {new_status}")
+
         root.destroy()
+    except Exception as e:
+        # If UI crashes instantly, you’ll see why in a messagebox + log
+        try:
+            log(f"UI crash: {e!r}")
+        except Exception:
+            pass
+        try:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror("USB Access Control", f"UI error:\n{e}")
+            r.destroy()
+        except Exception:
+            pass
 
-    cancel_btn = tk.Button(btn_row, text="Cancel", command=on_cancel)
-    style_button(cancel_btn)
-    cancel_btn.pack(side="right")
+# ------------------ Tray process (pystray) ------------------
+def make_icon_image(locked: bool):
+    """
+    Locked  = RED
+    Unlocked = GREEN
+    """
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
 
-    ok_btn = tk.Button(btn_row, text="OK / Whitelist", command=on_ok)
-    style_button(ok_btn)
-    ok_btn.pack(side="right", padx=(0, 10))
+    # Colors
+    if locked:
+        fill = (220, 60, 60, 255)      # red
+        outline = (130, 20, 20, 255)
+        letter = "L"
+    else:
+        fill = (70, 200, 120, 255)     # green
+        outline = (20, 90, 45, 255)
+        letter = "U"
 
-    # Enter submits (same as OK)
-    entry.bind("<Return>", lambda _e: on_ok())
+    # Main circle
+    d.ellipse((8, 8, 56, 56), fill=fill, outline=outline, width=3)
 
-    # Clear error as user types
-    def clear_error(*_):
-        if status.cget("text"):
-            status.config(text="")
+    # Inner highlight ring
+    d.ellipse((14, 14, 50, 50), outline=(255, 255, 255, 60), width=2)
 
-    pw_var.trace_add("write", clear_error)
+    # Big letter
+    # (We keep it simple without font loading to avoid extra deps)
+    d.text((26, 18), letter, fill=(255, 255, 255, 255))
 
-    # Close button behaves like cancel
-    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    return img
 
-    # Center window
-    root.update_idletasks()
-    w = root.winfo_width()
-    h = root.winfo_height()
-    x = (root.winfo_screenwidth() // 2) - (w // 2)
-    y = (root.winfo_screenheight() // 2) - (h // 2)
-    root.geometry(f"+{x}+{y}")
 
-    root.mainloop()
 
-    log(f"Prompt result for {pnp_id}: {'YES' if result['ok'] else 'NO'}")
-    return result["ok"]
+def run_tray():
+    locked = helper_status_locked()
+
+    icon = pystray.Icon("hid_usb_guard")
+    icon.icon = make_icon_image(locked)
+    icon.title = "HID+USB Guard (LOCKED)" if locked else "HID+USB Guard (UNLOCKED)"
+
+    def refresh():
+        nonlocal locked
+        locked = helper_status_locked()
+        icon.icon = make_icon_image(locked)
+        icon.title = "HID+USB Guard (LOCKED)" if locked else "HID+USB Guard (UNLOCKED)"
+
+    def on_toggle(_icon, _item):
+        try:
+            log(f"Launching UI: {sys.executable} {SCRIPT_PATH} --ui-toggle")
+            subprocess.Popen(
+                [sys.executable, SCRIPT_PATH, "--ui-toggle"],
+                cwd=BASE_DIR,
+                close_fds=True,
+            )
+        except Exception as e:
+            log(f"Failed to launch UI: {e!r}")
+
+    def on_refresh(_icon, _item):
+        refresh()
+
+    def on_exit(_icon, _item):
+        icon.stop()
+
+    icon.menu = pystray.Menu(
+        pystray.MenuItem("Lock/Unlock (HID + USB storage)", on_toggle),
+        pystray.MenuItem("Refresh status", on_refresh),
+        pystray.MenuItem("Exit", on_exit),
+    )
+
+    # Optional: refresh every few seconds
+    def poll():
+        while True:
+            time.sleep(5)
+            try:
+                refresh()
+            except Exception:
+                pass
+
+    import threading
+    threading.Thread(target=poll, daemon=True).start()
+
+    icon.run()
+
 
 def main():
-    log("Entering main loop.")
-    last = snapshot_hid_like()
-    log(f"Initial snapshot: {len(last)} devices")
+    if "--ui-toggle" in sys.argv:
+        run_ui_toggle()
+    else:
+        run_tray()
 
-    while True:
-        time.sleep(1.2)
-        wl = load_whitelist()
-        cur = snapshot_hid_like()
-        added = cur - last
-
-        if added:
-            log(f"Detected added: {len(added)}")
-
-        for dev in added:
-            if dev in wl:
-                log(f"Already whitelisted: {dev}")
-                continue
-            prompt_whitelist(dev)
-
-        last = cur
 
 if __name__ == "__main__":
     main()
